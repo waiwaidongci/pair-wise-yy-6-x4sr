@@ -1,58 +1,22 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { loadArchive, persist, withWriteLock } from "./archive.js";
+import { registerWater, correctWater } from "./water-service.js";
+import { createStick, openTest, judgeSignoff, computeStats, stickStatusOf, STICK_STAGES } from "./signoff-service.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "ink-stick-testing.json");
 const port = Number(process.env.PORT || 3037);
-const seed = {
-  "items": [
-    {
-      "code": "IS-001",
-      "smokeSource": "黄山松烟",
-      "glueRatio": "7.5%",
-      "ageYears": 8,
-      "storage": "恒湿柜B",
-      "status": "已试磨",
-      "logs": [
-        {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
-        }
-      ]
-    },
-    {
-      "code": "IS-002",
-      "smokeSource": "桐油烟",
-      "glueRatio": "8%",
-      "ageYears": 3,
-      "storage": "试样盒C",
-      "status": "待试磨",
-      "logs": []
-    }
-  ]
-};
-const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-const stages = ["待试磨","已试磨","重点观察"];
-const statLabels = ["待试磨","已试磨","重点观察"];
-const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
-async function body(req) {
+async function readBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    const error = new Error("请求体不是合法 JSON");
+    error.status = 400;
+    error.code = "bad_json";
+    throw error;
+  }
 }
 function send(res, status, data) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -62,96 +26,319 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "IS-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
+
+// 列表视图与统计均由同一份档案派生：开试结果、签样状态、水批准入一荣俱荣。
+function buildState(archive) {
+  const waterById = new Map(archive.waters.map((w) => [w.id, w]));
+  const activeSignsByWater = new Map();
+  for (const stick of archive.sticks) {
+    for (const test of stick.tests || []) {
+      if (test.sign && test.sign.valid) {
+        activeSignsByWater.set(test.waterId, (activeSignsByWater.get(test.waterId) || 0) + 1);
+      }
+    }
   }
-  return stats;
+  const waters = archive.waters.map((w) => ({ ...w, activeSigns: activeSignsByWater.get(w.id) || 0 }));
+  const sticks = archive.sticks.map((stick) => {
+    const tests = (stick.tests || []).map((test) => ({
+      ...test,
+      waterSource: (waterById.get(test.waterId) || {}).source || "未知水批",
+      waterStatus: (waterById.get(test.waterId) || {}).status || "未知"
+    }));
+    const open = tests.find((t) => t.status === "待签样");
+    return { ...stick, tests, status: stickStatusOf(stick), openTestId: open ? open.id : null };
+  });
+  const events = archive.events.slice(-30).reverse();
+  return { sticks, waters, events, stats: computeStats(archive) };
 }
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
-}
+
 function page() {
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>墨锭试磨室</title>
+  <title>试墨用水准入与签样复核台</title>
   <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
+    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; --amber:#9a6a1f; }
     * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
     header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
+    h1 { margin:0; font-size:24px; } h2 { margin:0 0 12px; font-size:17px; } h3 { margin:18px 0 10px; font-size:16px; }
+    main { display:grid; grid-template-columns:370px 1fr; gap:22px; padding:22px 28px; align-items:start; }
+    .side { display:grid; gap:14px; }
     form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
+    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; }
+    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:9px 13px; font-weight:700; cursor:pointer; margin-top:12px; } button.secondary { background:#69736a; margin-top:0; } button.danger { background:var(--warn); margin-top:0; }
+    .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:6px; }
+    .statgroup { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; display:grid; gap:8px; grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); }
+    .statgroup > .gtitle { grid-column:1/-1; color:var(--muted); font-size:12px; font-weight:700; }
+    .stat strong { display:block; font-size:22px; } .stat span { color:var(--muted); font-size:12px; }
+    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin:14px 0; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:7px; align-content:start; }
+    .meta { color:var(--muted); font-size:13px; }
+    .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 9px; font-size:12px; background:#f6f7f4; }
+    .pill.ok { color:var(--accent); border-color:var(--accent); } .pill.warn { color:var(--warn); border-color:var(--warn); } .pill.amber { color:var(--amber); border-color:var(--amber); }
+    .logs { border-top:1px solid var(--line); padding-top:8px; display:grid; gap:6px; max-height:220px; overflow:auto; }
+    .warn { color:var(--warn); font-weight:700; } .hint { font-size:12px; color:var(--muted); margin:8px 0 0; min-height:16px; }
+    .events { display:grid; gap:6px; max-height:260px; overflow:auto; }
+    #toast { position:fixed; right:20px; bottom:20px; display:grid; gap:8px; z-index:10; }
+    #toast div { background:#2b2f2a; color:#fff; padding:10px 14px; border-radius:8px; font-size:13px; max-width:360px; }
+    #toast div.error { background:var(--warn); }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .stats{grid-template-columns:1fr;} }
   </style>
 </head>
 <body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
+  <header>
+    <div><h1>试墨用水准入与签样复核台</h1><div class="meta">水批准入校验 · 一锭一试签样复核 · 档案落盘一致</div></div>
+    <button id="reload">刷新</button>
+  </header>
   <main>
-    <section>
-      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
+    <section class="side">
+      <form id="stickForm" class="panel">
+        <h2>墨锭建档</h2>
+        <label>墨锭编号</label><input name="code" required>
+        <label>烟料来源</label><input name="smokeSource">
+        <div class="row"><div><label>胶料比例</label><input name="glueRatio"></div><div><label>存放年限</label><input name="ageYears" type="number" min="0" value="0"></div></div>
+        <label>存放位置</label><input name="storage">
+        <button>建档</button>
+      </form>
+      <form id="waterForm" class="panel">
+        <h2>水批登记 · 准入校验</h2>
+        <label>水源</label><input name="source" required placeholder="如：桃花潭晨水">
+        <label>采集日</label><input name="collectedAt" type="date" required>
+        <div class="row"><div><label>余量（ml）</label><input name="remainingMl" type="number" min="0" step="1" required></div><div><label>浊度（度）</label><input name="turbidity" type="number" min="0" step="0.1" required></div></div>
+        <label>备注</label><input name="note">
+        <p class="hint">余量≥20ml 且浊度≤二度判为合格；余量不足或浊度超过二度仅转待换水，不予开试。</p>
+        <button>登记水批</button>
+      </form>
+      <form id="openForm" class="panel">
+        <h2>开试 · 每锭一条未结束试墨</h2>
+        <label>选择墨锭</label><select name="code" id="openStick"></select>
+        <label>试墨用水（仅合格水批）</label><select name="waterId" id="openWater"></select>
+        <label>试墨人</label><input name="tester" required>
+        <p class="hint" id="openHint"></p>
+        <button>开试（重复提交沿用首次结果）</button>
+      </form>
+      <form id="signForm" class="panel">
+        <h2>签样复核</h2>
+        <label>选择待签样试墨</label><select name="code" id="signStick"></select>
+        <p class="hint" id="signHint"></p>
+        <label>试纸</label><input name="paper" required placeholder="如：净皮宣纸">
+        <label>加水量</label><input name="waterAmount" required placeholder="如：20滴">
+        <label>出墨速度</label><select name="speed"><option>快</option><option>较快</option><option>中</option><option>较慢</option><option>慢</option></select>
+        <label>墨色层次</label><input name="colorLayer" required placeholder="如：浓淡四层，焦墨起甲">
+        <label>复核人（不得与试墨人相同）</label><input name="reviewer" required>
+        <button>提交签样复核</button>
+      </form>
     </section>
     <section>
       <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>选择墨锭后录入试磨记录，系统会保留多次试磨结果并更新评分状态。</h2><div class="grid" id="cards"></div></div>
+      <div class="toolbar">
+        <select id="statusFilter"><option value="">全部墨锭状态</option>${STICK_STAGES.map((s) => "<option>" + s + "</option>").join("")}</select>
+        <input id="search" placeholder="搜索编号、烟料、试墨人或复核人">
+      </div>
+      <h3>水批列表 · 水批校验</h3>
+      <div class="grid" id="waterCards"></div>
+      <h3>墨锭与试墨档案 · 签样判定</h3>
+      <div class="grid" id="stickCards"></div>
+      <div class="panel" style="margin-top:14px"><h3 style="margin-top:0">最近档案轨迹</h3><div class="events" id="events"></div></div>
     </section>
   </main>
+  <div id="toast"></div>
   <script>
-    const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-    const stages = ["待试磨","已试磨","重点观察"];
-    const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
+    const stickStages = ${JSON.stringify(STICK_STAGES)};
+    let state = { sticks: [], waters: [], events: [] };
+    const $ = (sel) => document.querySelector(sel);
+
     async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
+      const res = await fetch(path, options && options.body ? Object.assign({}, options, { headers: { 'Content-Type': 'application/json' } }) : options);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || '请求失败');
       return data;
     }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
+    function esc(value) {
+      return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
+    function whenTime(at) { return esc(String(at || '').replace('T', ' ').slice(0, 16)); }
+    function formObject(form) { return Object.fromEntries(new FormData(form).entries()); }
+    function toast(message, isError) {
+      const box = document.createElement('div');
+      if (isError) box.className = 'error';
+      box.textContent = message;
+      $('#toast').appendChild(box);
+      setTimeout(() => box.remove(), 4200);
+    }
+    function pill(text, cls) { return '<span class="pill ' + (cls || '') + '">' + esc(text) + '</span>'; }
+    function statusPill(status) {
+      const cls = status === '合格' || status === '已完成' || status === '已签样' ? 'ok'
+        : status === '待换水' || status === '待重测' ? 'warn'
+        : status === '试墨中' || status === '待签样' ? 'amber' : '';
+      return pill(status, cls);
+    }
+
+    function renderStats() {
+      const s = state.stats;
+      const group = (title, entries) => '<div class="statgroup"><div class="gtitle">' + title + '</div>' +
+        entries.map(([k, v]) => '<div class="stat"><span>' + esc(k) + '</span><strong>' + v + '</strong></div>').join('') + '</div>';
+      $('#stats').innerHTML =
+        group('墨锭', Object.entries(s.stickStats)) +
+        group('水批', Object.entries(s.waterStats)) +
+        group('签样', Object.entries(s.signStats));
+    }
+
+    function renderSelects() {
+      $('#openStick').innerHTML = state.sticks.map((stick) =>
+        '<option value="' + esc(stick.code) + '">' + esc(stick.code) + ' · ' + esc(stick.smokeSource) + ' · ' + esc(stick.status) + '</option>').join('');
+      $('#openWater').innerHTML = state.waters.map((water) =>
+        '<option value="' + esc(water.id) + '">' + esc(water.id) + ' · ' + esc(water.source) + ' · ' + esc(water.status) +
+        '（余量' + water.remainingMl + 'ml/浊度' + water.turbidity + '度）</option>').join('');
+      const pending = state.sticks.filter((stick) => stick.openTestId);
+      $('#signStick').innerHTML = pending.length
+        ? pending.map((stick) => '<option value="' + esc(stick.code) + '">' + esc(stick.code) + ' · ' + esc(stick.openTestId) + '</option>').join('')
+        : '<option value="">（暂无待签样试墨）</option>';
+      syncHints();
+    }
+
+    function syncHints() {
+      const openStick = state.sticks.find((stick) => stick.code === $('#openStick').value);
+      $('#openHint').textContent = openStick && openStick.openTestId
+        ? '该锭已有未结束试墨 ' + openStick.openTestId + '，提交将沿用首次结果，不另开新条。'
+        : '一锭只允许一条未结束试墨；开试前校验水批余量与浊度。';
+      const signStick = state.sticks.find((stick) => stick.code === $('#signStick').value);
+      const openTest = signStick && signStick.tests.find((t) => t.id === signStick.openTestId);
+      $('#signHint').textContent = openTest
+        ? '试墨人 ' + openTest.tester + '，用水 ' + openTest.waterId + '（' + openTest.waterSource + '）。复核人不得与试墨人相同。'
+        : '暂无待签样试墨。';
+    }
+
+    function waterCard(water) {
+      const note = '<div class="meta">采集日 ' + esc(water.collectedAt) + ' · 余量 ' + water.remainingMl +
+        'ml · 浊度 ' + water.turbidity + ' 度</div>';
+      const signs = '<div class="meta">有效签样 ' + water.activeSigns + ' 条</div>';
+      const desc = '<div class="meta">' + esc(water.note || '') + '</div>';
+      const button = '<button type="button" class="secondary" data-edit-water="' + esc(water.id) + '">更正水批</button>';
+      return '<article class="card" id="water-' + esc(water.id) + '"><h3 style="margin:0">' + esc(water.id) + ' · ' +
+        esc(water.source) + ' ' + statusPill(water.status) + '</h3>' + note + signs + desc + button + '</article>';
+    }
+
+    function editWaterCard(water) {
+      const card = $('#water-' + water.id);
+      card.innerHTML = '<h3 style="margin:0">更正 ' + esc(water.id) + '</h3>' +
+        '<label>水源</label><input data-f="source" value="' + esc(water.source) + '">' +
+        '<label>采集日</label><input data-f="collectedAt" type="date" value="' + esc(water.collectedAt) + '">' +
+        '<div class="row"><div><label>余量（ml）</label><input data-f="remainingMl" type="number" min="0" step="1" value="' + water.remainingMl + '"></div>' +
+        '<div><label>浊度（度）</label><input data-f="turbidity" type="number" min="0" step="0.1" value="' + water.turbidity + '"></div></div>' +
+        '<label>备注</label><input data-f="note" value="' + esc(water.note || '') + '">' +
+        (water.activeSigns ? '<p class="meta warn">该批水现有 ' + water.activeSigns + ' 条有效签样，更正后立即失效，相关墨锭须重测。</p>' : '<p class="meta">无有效签样，仅重新判准入。</p>') +
+        '<div style="display:flex;gap:8px"><button type="button" data-save-water="' + esc(water.id) + '">保存更正</button>' +
+        '<button type="button" class="secondary" data-cancel-water="' + esc(water.id) + '">取消</button></div>';
+    }
+
+    function testBlock(test) {
+      const head = '<div>' + esc(test.id) + ' ' + statusPill(test.status) +
+        '<span class="meta"> · ' + esc(test.waterId) + ' ' + esc(test.waterSource) + ' · 开试 ' + whenTime(test.openedAt) + '</span></div>';
+      const tester = '<div class="meta">试墨人 ' + esc(test.tester) + '</div>';
+      if (test.sign) {
+        const sign = '<div class="meta">签样：' + esc(test.sign.paper) + ' · 加水' + esc(test.sign.waterAmount) +
+          ' · 出墨' + esc(test.sign.speed) + ' · ' + esc(test.sign.colorLayer) + '<br>复核人 ' + esc(test.sign.reviewer) +
+          ' · ' + whenTime(test.sign.signedAt) + (test.sign.valid ? '' : '<span class="warn">（已失效：' + esc(test.sign.invalidReason || '水批更正') + '，须重测）</span>') + '</div>';
+        return head + tester + sign;
+      }
+      return head + tester + '<div class="meta">待签样，签样时复核水批余量与浊度</div>';
+    }
+
+    function stickCard(stick) {
+      const base = '<div class="meta">' + esc(stick.smokeSource) + ' · 胶 ' + esc(stick.glueRatio) +
+        ' · 陈 ' + stick.ageYears + ' 年 · ' + esc(stick.storage) + '</div>';
+      const tests = '<div class="logs">' + (stick.tests.length
+        ? stick.tests.slice().reverse().map(testBlock).join('')
+        : '<div class="meta">暂无试墨</div>') + '</div>';
+      return '<article class="card"><h3 style="margin:0">' + esc(stick.code) + ' ' + statusPill(stick.status) + '</h3>' + base + tests + '</article>';
+    }
+
+    function renderLists() {
+      $('#waterCards').innerHTML = state.waters.map(waterCard).join('') || '<div class="meta">尚未登记水批</div>';
+      const filter = $('#statusFilter').value;
+      const q = $('#search').value.trim();
+      const visible = state.sticks.filter((stick) =>
+        (!filter || stick.status === filter) &&
+        (!q || JSON.stringify(stick).includes(q)));
+      $('#stickCards').innerHTML = visible.map(stickCard).join('') || '<div class="meta">没有匹配的墨锭</div>';
+      $('#events').innerHTML = state.events.map((event) =>
+        '<div><span class="meta">' + whenTime(event.at) + '</span> ' + pill(event.type) +
+        ' <span class="meta">' + esc(event.stickCode || event.waterId || '') + '</span> ' + esc(event.note || '') + '</div>').join('');
+    }
+
     function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
+      renderStats();
+      renderSelects();
+      renderLists();
     }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
+    async function load() { state = await api('/api/state'); render(); }
+
+    async function submitForm(form, path, success) {
+      try {
+        const result = await api(path, { method: 'POST', body: JSON.stringify(formObject(form)) });
+        toast(success(result));
+        form.reset();
+        const dateInput = form.querySelector('input[type=date]');
+        if (dateInput) dateInput.value = new Date().toISOString().slice(0, 10);
+        await load();
+      } catch (error) { toast(error.message, true); }
     }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
+
+    $('#stickForm').addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitForm($('#stickForm'), '/api/sticks', () => '墨锭已建档');
+    });
+    $('#waterForm').addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitForm($('#waterForm'), '/api/waters', (water) => '水批 ' + water.id + ' 已登记，准入判定：' + water.status);
+    });
+    $('#openForm').addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitForm($('#openForm'), '/api/tests/open', (result) =>
+        result.reused ? '已有未结束试墨 ' + result.test.id + '，沿用首次结果' : '已开试 ' + result.test.id);
+    });
+    $('#signForm').addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitForm($('#signForm'), '/api/tests/sign', (test) => '签样已通过复核：' + test.id);
+    });
+
+    $('#waterCards').addEventListener('click', async (event) => {
+      const editId = event.target.dataset.editWater;
+      const cancelId = event.target.dataset.cancelWater;
+      const saveId = event.target.dataset.saveWater;
+      if (editId) {
+        const water = state.waters.find((w) => w.id === editId);
+        editWaterCard(water);
+        return;
+      }
+      if (cancelId) { await load(); return; }
+      if (saveId) {
+        const card = $('#water-' + saveId);
+        const payload = {};
+        card.querySelectorAll('[data-f]').forEach((input) => { payload[input.dataset.f] = input.value; });
+        if (payload.remainingMl !== undefined) payload.remainingMl = Number(payload.remainingMl);
+        if (payload.turbidity !== undefined) payload.turbidity = Number(payload.turbidity);
+        try {
+          const result = await api('/api/waters/' + encodeURIComponent(saveId), { method: 'PATCH', body: JSON.stringify(payload) });
+          toast('水批已更正，重新判定：' + result.water.status +
+            (result.invalidated.length ? '；' + result.invalidated.length + ' 条旧签样失效，须重测' : ''));
+          await load();
+        } catch (error) { toast(error.message, true); }
+      }
+    });
+
+    $('#statusFilter').addEventListener('change', renderLists);
+    $('#search').addEventListener('input', renderLists);
+    $('#openStick').addEventListener('change', syncHints);
+    $('#signStick').addEventListener('change', syncHints);
+    $('#reload').addEventListener('click', load);
+    const todayInput = document.querySelector('#waterForm input[type=date]');
+    if (todayInput) todayInput.value = new Date().toISOString().slice(0, 10);
+    load();
   </script>
 </body>
 </html>`;
@@ -160,55 +347,78 @@ function page() {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
+
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
-    if (req.method === "POST" && url.pathname === "/api/items") {
-      const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
-      db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+
+    if (req.method === "GET" && url.pathname === "/api/state") {
+      const archive = await loadArchive();
+      return send(res, 200, buildState(archive));
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
+    if (req.method === "GET" && url.pathname === "/api/stats") {
+      const archive = await loadArchive();
+      return send(res, 200, computeStats(archive));
     }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
+
+    if (req.method === "POST" && url.pathname === "/api/sticks") {
+      const input = await readBody(req);
+      const result = await withWriteLock(async () => {
+        const archive = await loadArchive();
+        const stick = createStick(archive, input);
+        await persist(archive);
+        return stick;
+      });
+      return send(res, 201, result);
     }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      const input = await body(req);
-      item.logs ||= [];
-      const score = Number(input.score || 0);
-      item.tests ||= [];
-      item.tests.push({ at: new Date().toISOString(), ...input, score });
-      item.status = score >= 85 ? "已试磨" : "重点观察";
-      item.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
-      await saveDb(db);
-      return send(res, 201, item);
+
+    if (req.method === "POST" && url.pathname === "/api/waters") {
+      const input = await readBody(req);
+      const result = await withWriteLock(async () => {
+        const archive = await loadArchive();
+        const water = registerWater(archive, input);
+        await persist(archive);
+        return water;
+      });
+      return send(res, 201, result);
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+
+    const waterPatch = url.pathname.match(/^\/api\/waters\/([^/]+)$/);
+    if (waterPatch && req.method === "PATCH") {
+      const input = await readBody(req);
+      const result = await withWriteLock(async () => {
+        const archive = await loadArchive();
+        const outcome = correctWater(archive, waterPatch[1], input);
+        await persist(archive);
+        return outcome;
+      });
+      return send(res, 200, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/tests/open") {
+      const input = await readBody(req);
+      const result = await withWriteLock(async () => {
+        const archive = await loadArchive();
+        const outcome = openTest(archive, input);
+        if (!outcome.reused) await persist(archive);
+        return outcome;
+      });
+      return send(res, result.reused ? 200 : 201, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/tests/sign") {
+      const input = await readBody(req);
+      const result = await withWriteLock(async () => {
+        const archive = await loadArchive();
+        const test = judgeSignoff(archive, input);
+        await persist(archive);
+        return test;
+      });
+      return send(res, 200, result);
+    }
+
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    send(res, error.status || 500, { error: error.code || "server_error", message: error.message });
   }
 });
-server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
+
+server.listen(port, () => console.log("试墨用水准入与签样复核台 listening on http://localhost:" + port));
