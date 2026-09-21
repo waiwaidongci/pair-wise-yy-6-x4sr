@@ -1,47 +1,65 @@
 {
   "items": [
     {
+      "id": "IS-SEED-001",
       "code": "IS-001",
       "smokeSource": "黄山松烟",
       "glueRatio": "7.5%",
       "ageYears": 8,
       "storage": "恒湿柜B",
-      "status": "已试磨",
-      "logs": [
+      "tests": [
         {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
+          "id": "TM-SEED-001",
+          "batchId": "WB-SEED-001",
+          "tester": "周墨工",
+          "startedAt": "2026-06-11T02:00:00.000Z",
+          "endedAt": "2026-06-11T03:10:00.000Z",
+          "status": "已结束",
+          "samples": [
+            {
+              "id": "QY-SEED-001",
+              "paper": "宣纸",
+              "water": "20滴",
+              "waterMl": 1,
+              "speed": "快",
+              "colorLayer": "黑亮有层次",
+              "tester": "周墨工",
+              "reviewer": "孙复核",
+              "submittedAt": "2026-06-11T03:00:00.000Z",
+              "reviewedAt": "2026-06-11T03:10:00.000Z",
+              "reviewNote": "历史迁移记录",
+              "status": "复核通过"
+            }
+          ]
         }
+      ],
+      "logs": [
+        { "at": "2026-06-11T03:10:00.000Z", "step": "复核", "note": "历史签样通过，状态：已试墨" }
       ]
     },
     {
+      "id": "IS-SEED-002",
       "code": "IS-002",
       "smokeSource": "桐油烟",
       "glueRatio": "8%",
       "ageYears": 3,
       "storage": "试样盒C",
-      "status": "重点观察",
+      "tests": [],
       "logs": [
-        {
-          "at": "2026-06-21T03:50:28.907Z",
-          "step": "试磨",
-          "note": "棉连纸，评分79",
-          "score": 79
-        }
-      ],
-      "tests": [
-        {
-          "at": "2026-06-21T03:50:28.907Z",
-          "paper": "棉连纸",
-          "water": "18滴",
-          "speed": "中",
-          "colorLayer": "偏暖",
-          "sediment": "少",
-          "score": 79
-        }
+        { "at": "2026-06-20T01:00:00.000Z", "step": "建档", "note": "墨锭建档，状态：待试墨" }
       ]
+    }
+  ],
+  "batches": [
+    {
+      "id": "WB-SEED-001",
+      "code": "WB-001",
+      "source": "虎跑泉水",
+      "collectedAt": "2026-06-09",
+      "residueMl": 480,
+      "turbidity": 1,
+      "status": "可用",
+      "createdAt": "2026-06-09T00:00:00.000Z"
     }
   ]
 }
